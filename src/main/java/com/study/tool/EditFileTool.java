@@ -13,7 +13,7 @@ public class EditFileTool implements Tool {
 
     @Override
     public String description() {
-        return "把文件中的唯一 old_string 替换为 new_string。";
+        return "把文件中的唯一 old_string 替换为 new_string。编辑前请先用 ReadFile 读取目标文件，确认 old_string 唯一。";
     }
 
     @Override

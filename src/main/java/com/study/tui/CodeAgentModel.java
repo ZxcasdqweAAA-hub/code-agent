@@ -2,13 +2,16 @@ package com.study.tui;
 
 import com.study.agent.Agent;
 import com.study.agent.AgentEvent;
+import com.study.agent.ApprovalRequest;
 import com.study.agent.CancelToken;
 import com.study.agent.Mode;
 import com.study.agent.Phase;
 import com.study.config.ProviderConfig;
 import com.study.conversation.ConversationManager;
 import com.study.llm.LlmClient;
-import com.study.prompt.PromptBuilder;
+import com.study.permission.Outcome;
+import com.study.permission.PermissionEngine;
+import com.study.prompt.Reminder;
 import com.study.tool.ToolRegistry;
 import com.study.tui.tea.Command;
 import com.study.tui.tea.KeyPressMessage;
@@ -29,6 +32,7 @@ public class CodeAgentModel implements Model {
     private final List<ProviderConfig> providers;
     private final String systemPrompt;
     private final ToolRegistry toolRegistry;
+    private final PermissionEngine permissions;
     private final ConversationManager conversation = new ConversationManager();
     private final List<ChatMessage> chatMessages = new ArrayList<>();
     private final MarkdownRenderer markdownRenderer = new MarkdownRenderer();
@@ -38,6 +42,9 @@ public class CodeAgentModel implements Model {
     private LlmClient client;
     private String input = "";
     private boolean streaming;
+    private boolean approving;
+    private ApprovalRequest pendingApproval;
+    private int approveCursor;
     private StringBuilder streamBuf = new StringBuilder();
     private BlockingQueue<AgentEvent> agentQueue;
     private Instant streamStart;
@@ -51,6 +58,8 @@ public class CodeAgentModel implements Model {
     private int iter;
     private long usageIn;
     private long usageOut;
+    private long cacheWrite;
+    private long cacheRead;
     private final List<ToolDisplay> curTools = new ArrayList<>();
     private CancelToken turnCancel;
 
@@ -59,9 +68,14 @@ public class CodeAgentModel implements Model {
     }
 
     public CodeAgentModel(List<ProviderConfig> providers, String systemPrompt, ToolRegistry toolRegistry) {
+        this(providers, systemPrompt, toolRegistry, PermissionEngine.create(Path.of("")));
+    }
+
+    public CodeAgentModel(List<ProviderConfig> providers, String systemPrompt, ToolRegistry toolRegistry, PermissionEngine permissions) {
         this.providers = List.copyOf(providers);
         this.systemPrompt = systemPrompt;
         this.toolRegistry = toolRegistry;
+        this.permissions = permissions == null ? PermissionEngine.create(Path.of("")) : permissions;
         this.state = providers.size() == 1 ? AppState.CHAT : AppState.PROVIDER_SELECT;
         if (providers.size() == 1) {
             initializeProvider(0);
@@ -88,8 +102,11 @@ public class CodeAgentModel implements Model {
                 return handleProviderSelect(key);
             }
             if (state == AppState.CHAT) {
+                if (approving) {
+                    return updateApproving(key);
+                }
                 if (streaming) {
-                    if ("ctrl+c".equals(key.key()) || "esc".equals(key.key())) {
+                    if ("ctrl+c".equals(key.key()) || "esc".equals(key.key()) || "escape".equals(key.key())) {
                         if (turnCancel != null) {
                             turnCancel.cancel();
                         }
@@ -121,6 +138,9 @@ public class CodeAgentModel implements Model {
                         .append("s)")
                         .append(Styles.RESET)
                         .append(System.lineSeparator());
+            }
+            if (approving && pendingApproval != null) {
+                out.append(renderApprovalBlock()).append(System.lineSeparator());
             }
             out.append(renderInputBox()).append(System.lineSeparator());
             out.append(renderStatus());
@@ -208,7 +228,7 @@ public class CodeAgentModel implements Model {
         }
         boolean executePlan = "/do".equalsIgnoreCase(trimmed);
         input = "";
-        String userText = executePlan ? PromptBuilder.EXECUTE_DIRECTIVE : text;
+        String userText = executePlan ? Reminder.EXECUTE_DIRECTIVE : text;
         if (executePlan) {
             mode = Mode.NORMAL;
         } else {
@@ -223,7 +243,7 @@ public class CodeAgentModel implements Model {
         iter = 0;
         curTools.clear();
         turnCancel = new CancelToken();
-        agentQueue = new Agent(client, toolRegistry).run(conversation, mode, turnCancel);
+        agentQueue = new Agent(client, toolRegistry, "0.1.0", permissions).run(conversation, mode, turnCancel);
         return stay(Command.tick(Duration.ofMillis(50), ignored -> pollAgent()));
     }
 
@@ -268,6 +288,12 @@ public class CodeAgentModel implements Model {
                     Command.println(renderMessagesRange(committedUpTo, chatMessages.size())),
                     Command.tick(Duration.ofMillis(50), ignored -> pollAgent())));
         }
+        if (event instanceof AgentEvent.Approval approval) {
+            pendingApproval = approval.request();
+            approveCursor = 0;
+            approving = true;
+            return stay(Command.println(renderApprovalBlock()));
+        }
         if (event instanceof AgentEvent.Failed error) {
             finishTurn();
             chatMessages.add(new ChatMessage("error", error.message(), true));
@@ -280,6 +306,8 @@ public class CodeAgentModel implements Model {
         if (event instanceof AgentEvent.UsageReport usage) {
             usageIn += usage.inputTokens();
             usageOut += usage.outputTokens();
+            cacheWrite += usage.cacheWrite();
+            cacheRead += usage.cacheRead();
             return quiet(Command.tick(Duration.ofMillis(50), ignored -> pollAgent()));
         }
         if (event instanceof AgentEvent.Notice notice) {
@@ -294,6 +322,55 @@ public class CodeAgentModel implements Model {
             return stay(Command.println(renderMessagesRange(committedUpTo, chatMessages.size())));
         }
         return stay(Command.none());
+    }
+
+    private UpdateResult<CodeAgentModel> updateApproving(KeyPressMessage key) {
+        switch (key.key()) {
+            case "ctrl+c", "esc", "escape" -> {
+                sendApproval(Outcome.DENY_ONCE);
+                if (turnCancel != null) {
+                    turnCancel.cancel();
+                }
+                return stay(Command.tick(Duration.ofMillis(50), ignored -> pollAgent()));
+            }
+            case "up" -> {
+                approveCursor = approveCursor == 0 ? 1 : approveCursor - 1;
+                return stay(Command.println(renderApprovalBlock()));
+            }
+            case "down" -> {
+                approveCursor = (approveCursor + 1) % 2;
+                return stay(Command.println(renderApprovalBlock()));
+            }
+            case "enter" -> {
+                sendApproval(approveCursor == 0 ? Outcome.ALLOW_ONCE : Outcome.DENY_ONCE);
+                return stay(Command.tick(Duration.ofMillis(50), ignored -> pollAgent()));
+            }
+            case "rune" -> {
+                String text = new String(key.runes()).trim().toLowerCase();
+                if ("1".equals(text) || "y".equals(text)) {
+                    sendApproval(Outcome.ALLOW_ONCE);
+                    return stay(Command.tick(Duration.ofMillis(50), ignored -> pollAgent()));
+                }
+                if ("2".equals(text) || "n".equals(text) || "d".equals(text)) {
+                    sendApproval(Outcome.DENY_ONCE);
+                    return stay(Command.tick(Duration.ofMillis(50), ignored -> pollAgent()));
+                }
+                return stay(Command.none());
+            }
+            default -> {
+                return stay(Command.none());
+            }
+        }
+    }
+
+    private void sendApproval(Outcome outcome) {
+        ApprovalRequest request = pendingApproval;
+        approving = false;
+        pendingApproval = null;
+        approveCursor = 0;
+        if (request != null) {
+            request.respond().offer(outcome);
+        }
     }
 
     private void initializeProvider(int index) {
@@ -390,9 +467,26 @@ public class CodeAgentModel implements Model {
         }
         String left = client.name() + (mode == Mode.PLAN ? " PLAN" : "");
         String usage = " ↑" + compact(usageIn) + " ↓" + compact(usageOut) + " tok";
+        if (cacheWrite > 0 || cacheRead > 0) {
+            usage += " cache " + compact(cacheWrite) + "/" + compact(cacheRead);
+        }
         String right = client.model() + usage;
         return Styles.DIM + left + "  " + " ".repeat(Math.max(1, width - left.length() - right.length() - 4))
                 + right + Styles.RESET;
+    }
+
+    private String renderApprovalBlock() {
+        if (pendingApproval == null) {
+            return "";
+        }
+        String allow = approveCursor == 0 ? Styles.GREEN + "> 1. Allow once" + Styles.RESET : "  1. Allow once";
+        String deny = approveCursor == 1 ? Styles.RED + "> 2. Deny once" + Styles.RESET : "  2. Deny once";
+        return Styles.BOLD + "approval required" + Styles.RESET + System.lineSeparator()
+                + "● " + pendingApproval.name() + "(" + pendingApproval.arguments() + ")" + System.lineSeparator()
+                + Styles.DIM + pendingApproval.reason() + Styles.RESET + System.lineSeparator()
+                + allow + System.lineSeparator()
+                + deny + System.lineSeparator()
+                + Styles.DIM + "↑↓ select · Enter confirm · Esc deny" + Styles.RESET;
     }
 
     private UpdateResult<CodeAgentModel> stay(Command command) {
@@ -421,6 +515,8 @@ public class CodeAgentModel implements Model {
 
     private void finishTurn() {
         streaming = false;
+        approving = false;
+        pendingApproval = null;
         curTools.clear();
         iter = 0;
         turnCancel = null;

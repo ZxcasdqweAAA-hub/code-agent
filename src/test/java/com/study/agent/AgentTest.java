@@ -2,13 +2,19 @@ package com.study.agent;
 
 import com.study.conversation.ConversationManager;
 import com.study.llm.LlmClient;
+import com.study.llm.Request;
 import com.study.llm.StreamEvent;
-import com.study.prompt.PromptBuilder;
+import com.study.llm.Usage;
+import com.study.permission.Outcome;
+import com.study.permission.PermissionEngine;
+import com.study.prompt.Reminder;
 import com.study.tool.Tool;
 import com.study.tool.ToolExecutionResult;
 import com.study.tool.ToolRegistry;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 
+import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -22,6 +28,9 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class AgentTest {
+    @TempDir
+    Path tempDir;
+
     @Test
     void runsMultipleToolRoundsUntilFinalAnswer() throws Exception {
         ConversationManager conversation = new ConversationManager();
@@ -59,7 +68,7 @@ class AgentTest {
     }
 
     @Test
-    void planModeSendsReadOnlyToolsAndSuffix() throws Exception {
+    void planModeSendsReadOnlyToolsAndReminder() throws Exception {
         ConversationManager conversation = new ConversationManager();
         conversation.addUserMessage("plan");
         FakeClient client = new FakeClient(List.of(List.of(new StreamEvent.TextDelta("plan"), new StreamEvent.StreamEnd("stop", 0, 0))));
@@ -67,8 +76,35 @@ class AgentTest {
         BlockingQueue<AgentEvent> events = new Agent(client, ToolRegistry.createDefault()).run(conversation, Mode.PLAN, new CancelToken());
         drainUntilDone(events);
 
-        assertEquals(PromptBuilder.PLAN_MODE_REMINDER, client.lastSuffix);
+        assertTrue(client.lastRequest.system().stable().contains("Code Agent"));
+        assertTrue(client.lastRequest.system().environment().contains("Working directory"));
+        assertTrue(client.lastRequest.reminder().contains("<system-reminder>"));
+        assertTrue(client.lastRequest.reminder().contains(Reminder.PLAN_REMINDER_FULL));
         assertTrue(client.lastTools.stream().allMatch(tool -> List.of("ReadFile", "Glob", "Grep").contains(tool.get("name"))));
+    }
+
+    @Test
+    void forwardsCacheUsage() throws Exception {
+        ConversationManager conversation = new ConversationManager();
+        conversation.addUserMessage("usage");
+        FakeClient client = new FakeClient(List.of(List.of(
+                new StreamEvent.UsageEvent(new Usage(10, 5, 3, 7)),
+                new StreamEvent.TextDelta("ok"),
+                new StreamEvent.StreamEnd("stop", 0, 0)
+        )));
+
+        BlockingQueue<AgentEvent> events = new Agent(client, ToolRegistry.createDefault()).run(conversation, Mode.NORMAL, new CancelToken());
+        List<AgentEvent> collected = drainUntilDone(events);
+
+        AgentEvent.UsageReport usage = collected.stream()
+                .filter(AgentEvent.UsageReport.class::isInstance)
+                .map(AgentEvent.UsageReport.class::cast)
+                .findFirst()
+                .orElseThrow();
+        assertEquals(10, usage.inputTokens());
+        assertEquals(5, usage.outputTokens());
+        assertEquals(3, usage.cacheWrite());
+        assertEquals(7, usage.cacheRead());
     }
 
     @Test
@@ -102,14 +138,77 @@ class AgentTest {
             }
         }));
 
-        BlockingQueue<AgentEvent> events = new Agent(client, registry).run(conversation, Mode.NORMAL, new CancelToken());
-        drainUntilDone(events);
+        BlockingQueue<AgentEvent> events = new Agent(client, registry, "dev", PermissionEngine.create(tempDir)).run(conversation, Mode.NORMAL, new CancelToken());
+        drainUntilDone(events, Outcome.ALLOW_ONCE);
 
         assertTrue(peak.get() >= 2);
         assertEquals(1, writesStartedAfterReads.get());
     }
 
+    @Test
+    void asksBeforeWriteToolAndContinuesWhenAllowed() throws Exception {
+        ConversationManager conversation = new ConversationManager();
+        conversation.addUserMessage("write");
+        FakeClient client = new FakeClient(List.of(
+                List.of(new StreamEvent.ToolCallComplete("write-1", "WriteFile",
+                        "{\"path\":\"" + jsonPath(tempDir.resolve("out.txt")) + "\",\"content\":\"hello\"}"),
+                        new StreamEvent.StreamEnd("tool_calls", 0, 0)),
+                List.of(new StreamEvent.TextDelta("wrote"), new StreamEvent.StreamEnd("stop", 0, 0))
+        ));
+
+        BlockingQueue<AgentEvent> events = new Agent(client, ToolRegistry.createDefault(), "dev", PermissionEngine.create(tempDir))
+                .run(conversation, Mode.NORMAL, new CancelToken());
+        List<AgentEvent> collected = drainUntilDone(events, Outcome.ALLOW_ONCE);
+
+        assertTrue(collected.stream().anyMatch(event -> event instanceof AgentEvent.Approval));
+        assertTrue(collected.stream().anyMatch(event -> event instanceof AgentEvent.Text text && text.delta().contains("wrote")));
+    }
+
+    @Test
+    void denialIsReturnedAsToolResult() throws Exception {
+        ConversationManager conversation = new ConversationManager();
+        conversation.addUserMessage("write");
+        FakeClient client = new FakeClient(List.of(
+                List.of(new StreamEvent.ToolCallComplete("write-1", "WriteFile",
+                        "{\"path\":\"" + jsonPath(tempDir.resolve("out.txt")) + "\",\"content\":\"hello\"}"),
+                        new StreamEvent.StreamEnd("tool_calls", 0, 0)),
+                List.of(new StreamEvent.TextDelta("denied handled"), new StreamEvent.StreamEnd("stop", 0, 0))
+        ));
+
+        BlockingQueue<AgentEvent> events = new Agent(client, ToolRegistry.createDefault(), "dev", PermissionEngine.create(tempDir))
+                .run(conversation, Mode.NORMAL, new CancelToken());
+        drainUntilDone(events, Outcome.DENY_ONCE);
+
+        assertTrue(conversation.getMessages().stream()
+                .flatMap(message -> message.toolResults().stream())
+                .anyMatch(result -> result.error() && result.content().contains("Permission denied by user")));
+    }
+
+    @Test
+    void blacklistDenialDoesNotAskUser() throws Exception {
+        ConversationManager conversation = new ConversationManager();
+        conversation.addUserMessage("danger");
+        FakeClient client = new FakeClient(List.of(
+                List.of(new StreamEvent.ToolCallComplete("bash-1", "Bash", "{\"command\":\"git reset --hard HEAD\"}"),
+                        new StreamEvent.StreamEnd("tool_calls", 0, 0)),
+                List.of(new StreamEvent.TextDelta("safe"), new StreamEvent.StreamEnd("stop", 0, 0))
+        ));
+
+        BlockingQueue<AgentEvent> events = new Agent(client, ToolRegistry.createDefault(), "dev", PermissionEngine.create(tempDir))
+                .run(conversation, Mode.NORMAL, new CancelToken());
+        List<AgentEvent> collected = drainUntilDone(events);
+
+        assertTrue(collected.stream().noneMatch(event -> event instanceof AgentEvent.Approval));
+        assertTrue(conversation.getMessages().stream()
+                .flatMap(message -> message.toolResults().stream())
+                .anyMatch(result -> result.error() && result.content().contains("Permission denied")));
+    }
+
     private List<AgentEvent> drainUntilDone(BlockingQueue<AgentEvent> events) throws InterruptedException {
+        return drainUntilDone(events, null);
+    }
+
+    private List<AgentEvent> drainUntilDone(BlockingQueue<AgentEvent> events, Outcome approval) throws InterruptedException {
         List<AgentEvent> collected = new ArrayList<>();
         while (true) {
             AgentEvent event = events.poll(5, TimeUnit.SECONDS);
@@ -117,10 +216,17 @@ class AgentTest {
                 throw new AssertionError("Timed out waiting for agent event");
             }
             collected.add(event);
+            if (event instanceof AgentEvent.Approval request && approval != null) {
+                request.request().respond().offer(approval);
+            }
             if (event instanceof AgentEvent.Done || event instanceof AgentEvent.Failed) {
                 return collected;
             }
         }
+    }
+
+    private String jsonPath(Path path) {
+        return path.toString().replace("\\", "\\\\");
     }
 
     private static final class FakeClient implements LlmClient {
@@ -129,7 +235,7 @@ class AgentTest {
         private int index;
         private int calls;
         private List<Map<String, Object>> lastTools = List.of();
-        private String lastSuffix = "";
+        private Request lastRequest;
 
         private FakeClient(List<List<StreamEvent>> scripts) {
             this(scripts, false);
@@ -141,16 +247,11 @@ class AgentTest {
         }
 
         @Override
-        public BlockingQueue<StreamEvent> stream(ConversationManager conv, List<Map<String, Object>> tools) {
-            return stream(conv, tools, "");
-        }
-
-        @Override
-        public BlockingQueue<StreamEvent> stream(ConversationManager conv, List<Map<String, Object>> tools, String systemSuffix) {
+        public BlockingQueue<StreamEvent> stream(Request request) {
             BlockingQueue<StreamEvent> queue = new LinkedBlockingQueue<>();
             calls++;
-            lastTools = List.copyOf(tools);
-            lastSuffix = systemSuffix;
+            lastRequest = request;
+            lastTools = List.copyOf(request.tools());
             if (endlessUnknown) {
                 queue.add(new StreamEvent.ToolCallComplete("unknown-" + calls, "MissingTool", "{}"));
                 queue.add(new StreamEvent.StreamEnd("tool_calls", 0, 0));

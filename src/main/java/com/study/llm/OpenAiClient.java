@@ -4,7 +4,6 @@ import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.study.config.ProviderConfig;
-import com.study.conversation.ConversationManager;
 import com.study.conversation.Message;
 
 import java.io.BufferedReader;
@@ -35,14 +34,9 @@ public class OpenAiClient implements LlmClient {
     }
 
     @Override
-    public BlockingQueue<StreamEvent> stream(ConversationManager conv, List<Map<String, Object>> tools) {
-        return stream(conv, tools, "");
-    }
-
-    @Override
-    public BlockingQueue<StreamEvent> stream(ConversationManager conv, List<Map<String, Object>> tools, String systemSuffix) {
+    public BlockingQueue<StreamEvent> stream(Request request) {
         BlockingQueue<StreamEvent> queue = new LinkedBlockingQueue<>();
-        Thread.ofVirtual().name("openai-stream").start(() -> streamIntoQueue(conv, tools, systemSuffix, queue));
+        Thread.ofVirtual().name("openai-stream").start(() -> streamIntoQueue(request, queue));
         return queue;
     }
 
@@ -56,13 +50,13 @@ public class OpenAiClient implements LlmClient {
         return config.getModel();
     }
 
-    private void streamIntoQueue(ConversationManager conv, List<Map<String, Object>> tools, String systemSuffix, BlockingQueue<StreamEvent> queue) {
+    private void streamIntoQueue(Request req, BlockingQueue<StreamEvent> queue) {
         try {
             HttpRequest request = HttpRequest.newBuilder(endpoint())
                     .timeout(Duration.ofMinutes(5))
                     .header("Authorization", "Bearer " + config.getApiKey())
                     .header("Content-Type", "application/json")
-                    .POST(HttpRequest.BodyPublishers.ofString(requestBody(conv.getMessages(), tools, systemSuffix)))
+                    .POST(HttpRequest.BodyPublishers.ofString(requestBody(req)))
                     .build();
             HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
             if (!isSuccess(response.statusCode())) {
@@ -94,12 +88,13 @@ public class OpenAiClient implements LlmClient {
         return URI.create(normalized + "/v1/chat/completions");
     }
 
-    private String requestBody(List<Message> messages, List<Map<String, Object>> tools, String systemSuffix) throws JsonProcessingException {
+    private String requestBody(Request req) throws JsonProcessingException {
         Map<String, Object> body = new LinkedHashMap<>();
         body.put("model", config.getModel());
         body.put("stream", true);
         body.put("stream_options", Map.of("include_usage", true));
-        body.put("messages", openAiMessages(messages, systemSuffix));
+        body.put("messages", openAiMessages(req));
+        List<Map<String, Object>> tools = req.tools();
         if (tools != null && !tools.isEmpty()) {
             body.put("tools", openAiTools(tools));
             body.put("tool_choice", "auto");
@@ -107,10 +102,10 @@ public class OpenAiClient implements LlmClient {
         return JSON.writeValueAsString(body);
     }
 
-    private List<Map<String, Object>> openAiMessages(List<Message> messages, String systemSuffix) {
+    private List<Map<String, Object>> openAiMessages(Request req) {
         List<Map<String, Object>> converted = new ArrayList<>();
-        converted.add(Map.of("role", "system", "content", effectiveSystem(systemSuffix)));
-        for (Message message : messages) {
+        converted.add(Map.of("role", "system", "content", openAiSystem(req.system())));
+        for (Message message : req.messages()) {
             if ("tool".equals(message.role())) {
                 for (ToolResult result : message.toolResults()) {
                     converted.add(Map.of(
@@ -137,14 +132,18 @@ public class OpenAiClient implements LlmClient {
                 converted.add(Map.of("role", message.role(), "content", message.content()));
             }
         }
+        if (!req.reminder().isBlank()) {
+            converted.add(Map.of("role", "user", "content", req.reminder()));
+        }
         return converted;
     }
 
-    private String effectiveSystem(String systemSuffix) {
-        if (systemSuffix == null || systemSuffix.isBlank()) {
-            return systemPrompt;
+    private String openAiSystem(LlmSystem system) {
+        String stable = !system.stable().isBlank() ? system.stable() : systemPrompt;
+        if (system.environment().isBlank()) {
+            return stable;
         }
-        return systemPrompt + "\n\n" + systemSuffix;
+        return stable + "\n\n" + system.environment();
     }
 
     private List<Map<String, Object>> openAiTools(List<Map<String, Object>> tools) {
@@ -175,9 +174,12 @@ public class OpenAiClient implements LlmClient {
                 JsonNode root = JSON.readTree(data);
                 JsonNode usage = root.path("usage");
                 if (usage.isObject() && !usage.isMissingNode() && !usage.isNull()) {
+                    long cacheRead = usage.path("prompt_tokens_details").path("cached_tokens").asLong(0);
                     queue.add(new StreamEvent.UsageEvent(new Usage(
                             usage.path("prompt_tokens").asLong(0),
-                            usage.path("completion_tokens").asLong(0))));
+                            usage.path("completion_tokens").asLong(0),
+                            0,
+                            cacheRead)));
                 }
                 JsonNode delta = root.path("choices").path(0).path("delta");
                 JsonNode content = delta.path("content");

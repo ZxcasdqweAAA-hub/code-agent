@@ -1,5 +1,7 @@
 package com.study.llm;
 
-/** 本轮请求的输入/输出 token 用量。 */
-public record Usage(long inputTokens, long outputTokens) {
+public record Usage(long inputTokens, long outputTokens, long cacheWrite, long cacheRead) {
+    public Usage(long inputTokens, long outputTokens) {
+        this(inputTokens, outputTokens, 0, 0);
+    }
 }

@@ -90,14 +90,11 @@ public class Program {
         if (ch == 27) {
             int next = reader.read(10L);
             if (next == '[') {
+                return readEscapeSequence(reader);
+            }
+            if (next == 'O') {
                 int code = reader.read(10L);
-                return switch (code) {
-                    case 'A' -> new KeyPressMessage("up", new char[0]);
-                    case 'B' -> new KeyPressMessage("down", new char[0]);
-                    case 'C' -> new KeyPressMessage("right", new char[0]);
-                    case 'D' -> new KeyPressMessage("left", new char[0]);
-                    default -> new KeyPressMessage("escape", new char[0]);
-                };
+                return arrowKey(code);
             }
             if (next == 10 || next == 13) {
                 return new KeyPressMessage("alt+enter", new char[]{'\n'});
@@ -108,6 +105,33 @@ public class Program {
             return new KeyPressMessage("escape", new char[0]);
         }
         return new KeyPressMessage("rune", Character.toChars(ch));
+    }
+
+    private Message readEscapeSequence(NonBlockingReader reader) throws IOException {
+        int code = reader.read(10L);
+        if (code == 'A' || code == 'B' || code == 'C' || code == 'D') {
+            return arrowKey(code);
+        }
+        while (code >= 0) {
+            if (code == 'A' || code == 'B' || code == 'C' || code == 'D') {
+                return arrowKey(code);
+            }
+            if (Character.isLetter(code) || code == '~') {
+                return new KeyPressMessage("escape", new char[0]);
+            }
+            code = reader.read(10L);
+        }
+        return new KeyPressMessage("escape", new char[0]);
+    }
+
+    private Message arrowKey(int code) {
+        return switch (code) {
+            case 'A' -> new KeyPressMessage("up", new char[0]);
+            case 'B' -> new KeyPressMessage("down", new char[0]);
+            case 'C' -> new KeyPressMessage("right", new char[0]);
+            case 'D' -> new KeyPressMessage("left", new char[0]);
+            default -> new KeyPressMessage("escape", new char[0]);
+        };
     }
 
     private void dispatch(Message msg) {

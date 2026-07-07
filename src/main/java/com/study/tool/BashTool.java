@@ -14,7 +14,7 @@ public class BashTool implements Tool {
 
     @Override
     public String description() {
-        return "在当前工作目录执行 shell 命令，返回输出和退出码。";
+        return "在当前工作目录执行 shell 命令，返回输出和退出码。读文件、找文件、搜内容请优先用 ReadFile、Glob、Grep，不要用 Bash 拼凑。";
     }
 
     @Override

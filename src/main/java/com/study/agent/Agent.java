@@ -3,11 +3,19 @@ package com.study.agent;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.study.conversation.ConversationManager;
+import com.study.llm.LlmSystem;
 import com.study.llm.LlmClient;
+import com.study.llm.Request;
 import com.study.llm.StreamEvent;
 import com.study.llm.ToolCall;
 import com.study.llm.ToolResult;
+import com.study.permission.Decision;
+import com.study.permission.Outcome;
+import com.study.permission.PermissionEngine;
+import com.study.permission.PermissionResult;
+import com.study.prompt.Environment;
 import com.study.prompt.PromptBuilder;
+import com.study.prompt.Reminder;
 import com.study.tool.ToolExecutionResult;
 import com.study.tool.ToolRegistry;
 import com.study.tool.Truncate;
@@ -20,10 +28,12 @@ import java.util.Objects;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.TimeUnit;
 
 public final class Agent {
     public static final int MAX_ITERATIONS = 25;
     public static final int MAX_UNKNOWN_RUN = 3;
+    private static final int PLAN_REMINDER_INTERVAL = 4;
     public static final String NOTICE_MAX_ITER = "(已达最大迭代轮数 25，自动停止；可继续发消息推进。)";
     public static final String NOTICE_UNKNOWN_TOOLS = "(连续多轮只请求到未注册的工具，自动停止。)";
     public static final String NOTICE_STREAM_ERR = "(请求出错，本轮已中断。)";
@@ -33,10 +43,22 @@ public final class Agent {
 
     private final LlmClient client;
     private final ToolRegistry registry;
+    private final String version;
+    private final PermissionEngine permissions;
 
     public Agent(LlmClient client, ToolRegistry registry) {
+        this(client, registry, "dev");
+    }
+
+    public Agent(LlmClient client, ToolRegistry registry, String version) {
+        this(client, registry, version, PermissionEngine.create(java.nio.file.Path.of("")));
+    }
+
+    public Agent(LlmClient client, ToolRegistry registry, String version, PermissionEngine permissions) {
         this.client = client;
         this.registry = registry;
+        this.version = version == null || version.isBlank() ? "dev" : version;
+        this.permissions = permissions == null ? PermissionEngine.create(java.nio.file.Path.of("")) : permissions;
     }
 
     public BlockingQueue<AgentEvent> run(ConversationManager conversation) {
@@ -55,7 +77,8 @@ public final class Agent {
             List<Map<String, Object>> definitions = mode == Mode.PLAN
                     ? registry.readOnlyDefinitions()
                     : registry.getAllSchemas("openai");
-            String suffix = mode == Mode.PLAN ? PromptBuilder.PLAN_MODE_REMINDER : "";
+            String stableSystem = PromptBuilder.buildSystemPrompt();
+            String environment = Environment.gather(version, client.model()).render();
 
             for (int iter = 1; iter <= MAX_ITERATIONS; iter++) {
                 if (!emit(cancel, out, new AgentEvent.Iter(iter))) {
@@ -63,7 +86,8 @@ public final class Agent {
                     return;
                 }
 
-                StreamCapture capture = streamOnce(conversation, definitions, suffix, out, cancel);
+                String reminder = reminderFor(mode, iter);
+                StreamCapture capture = streamOnce(conversation, definitions, stableSystem, environment, reminder, out, cancel);
                 if (capture.error != null) {
                     if (cancel.isCancelled()) {
                         finishCancelled(conversation, out);
@@ -75,7 +99,11 @@ public final class Agent {
                     return;
                 }
                 if (capture.usage != null) {
-                    out.add(new AgentEvent.UsageReport(capture.usage.inputTokens(), capture.usage.outputTokens()));
+                    out.add(new AgentEvent.UsageReport(
+                            capture.usage.inputTokens(),
+                            capture.usage.outputTokens(),
+                            capture.usage.cacheWrite(),
+                            capture.usage.cacheRead()));
                 }
 
                 if (capture.toolCalls.isEmpty()) {
@@ -112,35 +140,50 @@ public final class Agent {
         }
     }
 
-    private StreamCapture streamOnce(ConversationManager conversation, List<Map<String, Object>> tools, String suffix,
+    private StreamCapture streamOnce(ConversationManager conversation, List<Map<String, Object>> tools,
+                                     String stableSystem, String environment, String reminder,
                                      BlockingQueue<AgentEvent> out, CancelToken cancel) throws InterruptedException {
         StreamCapture capture = new StreamCapture();
-        BlockingQueue<StreamEvent> stream = client.stream(conversation, tools, suffix);
+        Request request = new Request(conversation.getMessages(), tools, new LlmSystem(stableSystem, environment), reminder);
+        BlockingQueue<StreamEvent> stream = client.stream(request);
         while (true) {
             if (cancel.isCancelled()) {
                 capture.error = NOTICE_CANCELLED;
                 return capture;
             }
             StreamEvent event = stream.take();
-            if (event instanceof StreamEvent.TextDelta delta) {
-                capture.text.append(delta.text());
-                emit(cancel, out, new AgentEvent.Text(delta.text()));
-            } else if (event instanceof StreamEvent.ThinkingDelta) {
-                // Thinking is intentionally ignored and never enters conversation history.
-            } else if (event instanceof StreamEvent.ToolCallComplete toolCall) {
-                capture.toolCalls.add(toolCall.toToolCall());
-            } else if (event instanceof StreamEvent.UsageEvent usage) {
-                capture.usage = usage.usage();
-            } else if (event instanceof StreamEvent.StreamEnd end) {
-                if (capture.usage == null && (end.inputTokens() > 0 || end.outputTokens() > 0)) {
-                    capture.usage = new com.study.llm.Usage(end.inputTokens(), end.outputTokens());
+            switch (event) {
+                case StreamEvent.TextDelta delta -> {
+                    capture.text.append(delta.text());
+                    emit(cancel, out, new AgentEvent.Text(delta.text()));
                 }
-                return capture;
-            } else if (event instanceof StreamEvent.Error error) {
-                capture.error = error.message();
-                return capture;
+                case StreamEvent.ThinkingDelta thinkingDelta -> {
+                    // Thinking is intentionally ignored and never enters conversation history.
+                }
+                case StreamEvent.ToolCallComplete toolCall -> capture.toolCalls.add(toolCall.toToolCall());
+                case StreamEvent.UsageEvent usage -> capture.usage = usage.usage();
+                case StreamEvent.StreamEnd end -> {
+                    if (capture.usage == null && (end.inputTokens() > 0 || end.outputTokens() > 0)) {
+                        capture.usage = new com.study.llm.Usage(end.inputTokens(), end.outputTokens());
+                    }
+                    return capture;
+                }
+                case StreamEvent.Error error -> {
+                    capture.error = error.message();
+                    return capture;
+                }
+                default -> {
+                }
             }
         }
+    }
+
+    private String reminderFor(Mode mode, int iter) {
+        if (mode != Mode.PLAN) {
+            return "";
+        }
+        boolean full = iter == 1 || (iter - 1) % PLAN_REMINDER_INTERVAL == 0;
+        return Reminder.plan(full);
     }
 
     private BatchOutcome executeBatched(List<ToolCall> calls, CancelToken cancel, BlockingQueue<AgentEvent> out)
@@ -179,7 +222,7 @@ public final class Agent {
             int index = i;
             Thread.ofVirtual().name("tool-" + calls.get(index).name()).start(() -> {
                 try {
-                    results[index] = executeOneNoEvents(calls.get(index), cancel);
+                    results[index] = executeOneNoEvents(calls.get(index), cancel, out);
                 } finally {
                     latch.countDown();
                 }
@@ -196,18 +239,49 @@ public final class Agent {
 
     private ToolResult executeOne(ToolCall call, CancelToken cancel, BlockingQueue<AgentEvent> out) {
         out.add(new AgentEvent.Tool(new ToolEvent(call.id(), call.name(), preview(call.arguments()), Phase.START, "", false)));
-        ToolResult result = executeOneNoEvents(call, cancel);
+        ToolResult result = executeOneNoEvents(call, cancel, out);
         out.add(new AgentEvent.Tool(new ToolEvent(call.id(), call.name(), preview(call.arguments()), Phase.END,
                 summarize(result.content()), result.error())));
         return result;
     }
 
-    private ToolResult executeOneNoEvents(ToolCall call, CancelToken cancel) {
+    private ToolResult executeOneNoEvents(ToolCall call, CancelToken cancel, BlockingQueue<AgentEvent> out) {
         if (cancel.isCancelled()) {
             return new ToolResult(call.id(), NOTICE_CANCELLED, true);
         }
+        if (registry.get(call.name()).isEmpty()) {
+            ToolExecutionResult result = registry.execute(call.name(), call.arguments());
+            return new ToolResult(call.id(), result.content(), result.error());
+        }
+        PermissionResult permission = permissions.check(call);
+        if (permission.decision() == Decision.DENY) {
+            return new ToolResult(call.id(), "Permission denied: " + permission.reason(), true);
+        }
+        if (permission.decision() == Decision.ASK) {
+            Outcome outcome = requestApproval(call, permission.reason(), cancel, out);
+            if (outcome != Outcome.ALLOW_ONCE) {
+                return new ToolResult(call.id(), "Permission denied by user: " + permission.reason(), true);
+            }
+        }
         ToolExecutionResult result = registry.execute(call.name(), call.arguments());
         return new ToolResult(call.id(), result.content(), result.error());
+    }
+
+    private Outcome requestApproval(ToolCall call, String reason, CancelToken cancel, BlockingQueue<AgentEvent> out) {
+        ApprovalRequest request = new ApprovalRequest(call.name(), call.arguments(), reason);
+        out.add(new AgentEvent.Approval(request));
+        while (!cancel.isCancelled()) {
+            try {
+                Outcome outcome = request.respond().poll(100, TimeUnit.MILLISECONDS);
+                if (outcome != null) {
+                    return outcome;
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return Outcome.DENY_ONCE;
+            }
+        }
+        return Outcome.DENY_ONCE;
     }
 
     private void fillCancelled(List<ToolCall> calls, ToolResult[] results, int from) {

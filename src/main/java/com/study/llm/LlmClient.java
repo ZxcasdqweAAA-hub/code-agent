@@ -1,16 +1,11 @@
 package com.study.llm;
 
 import com.study.config.ProviderConfig;
-import com.study.conversation.ConversationManager;
 
-import java.util.List;
-import java.util.Map;
 import java.util.concurrent.BlockingQueue;
 
 public interface LlmClient {
-    BlockingQueue<StreamEvent> stream(ConversationManager conv, List<Map<String, Object>> tools);
-
-    BlockingQueue<StreamEvent> stream(ConversationManager conv, List<Map<String, Object>> tools, String systemSuffix);
+    BlockingQueue<StreamEvent> stream(Request request);
 
     String name();
 

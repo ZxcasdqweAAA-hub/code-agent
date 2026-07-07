@@ -4,7 +4,6 @@ import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.study.config.ProviderConfig;
-import com.study.conversation.ConversationManager;
 import com.study.conversation.Message;
 
 import java.io.BufferedReader;
@@ -35,14 +34,9 @@ public class AnthropicClient implements LlmClient {
     }
 
     @Override
-    public BlockingQueue<StreamEvent> stream(ConversationManager conv, List<Map<String, Object>> tools) {
-        return stream(conv, tools, "");
-    }
-
-    @Override
-    public BlockingQueue<StreamEvent> stream(ConversationManager conv, List<Map<String, Object>> tools, String systemSuffix) {
+    public BlockingQueue<StreamEvent> stream(Request request) {
         BlockingQueue<StreamEvent> queue = new LinkedBlockingQueue<>();
-        Thread.ofVirtual().name("anthropic-stream").start(() -> streamIntoQueue(conv, tools, systemSuffix, queue));
+        Thread.ofVirtual().name("anthropic-stream").start(() -> streamIntoQueue(request, queue));
         return queue;
     }
 
@@ -56,14 +50,14 @@ public class AnthropicClient implements LlmClient {
         return config.getModel();
     }
 
-    private void streamIntoQueue(ConversationManager conv, List<Map<String, Object>> tools, String systemSuffix, BlockingQueue<StreamEvent> queue) {
+    private void streamIntoQueue(Request req, BlockingQueue<StreamEvent> queue) {
         try {
             HttpRequest request = HttpRequest.newBuilder(endpoint())
                     .timeout(Duration.ofMinutes(5))
                     .header("x-api-key", config.getApiKey())
                     .header("anthropic-version", "2023-06-01")
                     .header("Content-Type", "application/json")
-                    .POST(HttpRequest.BodyPublishers.ofString(requestBody(conv.getMessages(), tools, systemSuffix)))
+                    .POST(HttpRequest.BodyPublishers.ofString(requestBody(req)))
                     .build();
             HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
             if (response.statusCode() < 200 || response.statusCode() >= 300) {
@@ -95,13 +89,14 @@ public class AnthropicClient implements LlmClient {
         return URI.create(normalized + "/v1/messages");
     }
 
-    private String requestBody(List<Message> messages, List<Map<String, Object>> tools, String systemSuffix) throws JsonProcessingException {
+    private String requestBody(Request req) throws JsonProcessingException {
         Map<String, Object> body = new LinkedHashMap<>();
         body.put("model", config.getModel());
-        body.put("system", effectiveSystem(systemSuffix));
+        body.put("system", anthropicSystem(req.system()));
         body.put("max_tokens", 4096);
         body.put("stream", true);
-        body.put("messages", anthropicMessages(messages));
+        body.put("messages", anthropicMessages(req.messages(), req.reminder()));
+        List<Map<String, Object>> tools = req.tools();
         if (tools != null && !tools.isEmpty()) {
             body.put("tools", anthropicTools(tools));
         }
@@ -111,14 +106,22 @@ public class AnthropicClient implements LlmClient {
         return JSON.writeValueAsString(body);
     }
 
-    private String effectiveSystem(String systemSuffix) {
-        if (systemSuffix == null || systemSuffix.isBlank()) {
-            return systemPrompt;
+    private List<Map<String, Object>> anthropicSystem(LlmSystem system) {
+        List<Map<String, Object>> blocks = new ArrayList<>();
+        String stable = !system.stable().isBlank() ? system.stable() : systemPrompt;
+        if (!stable.isBlank()) {
+            blocks.add(Map.of(
+                    "type", "text",
+                    "text", stable,
+                    "cache_control", Map.of("type", "ephemeral")));
         }
-        return systemPrompt + "\n\n" + systemSuffix;
+        if (!system.environment().isBlank()) {
+            blocks.add(Map.of("type", "text", "text", system.environment()));
+        }
+        return blocks;
     }
 
-    private List<Map<String, Object>> anthropicMessages(List<Message> messages) {
+    private List<Map<String, Object>> anthropicMessages(List<Message> messages, String reminder) {
         List<Map<String, Object>> converted = new ArrayList<>();
         for (Message message : messages) {
             if ("tool".equals(message.role())) {
@@ -150,7 +153,30 @@ public class AnthropicClient implements LlmClient {
                 converted.add(Map.of("role", message.role(), "content", message.content()));
             }
         }
+        appendReminder(converted, reminder);
         return converted;
+    }
+
+    private void appendReminder(List<Map<String, Object>> messages, String reminder) {
+        if (reminder == null || reminder.isBlank()) {
+            return;
+        }
+        Map<String, Object> block = Map.of("type", "text", "text", reminder);
+        if (messages.isEmpty() || !"user".equals(messages.get(messages.size() - 1).get("role"))) {
+            messages.add(Map.of("role", "user", "content", List.of(block)));
+            return;
+        }
+        Map<String, Object> last = new LinkedHashMap<>(messages.remove(messages.size() - 1));
+        Object content = last.get("content");
+        List<Object> blocks = new ArrayList<>();
+        if (content instanceof List<?> list) {
+            blocks.addAll(list);
+        } else if (content instanceof String text && !text.isBlank()) {
+            blocks.add(Map.of("type", "text", "text", text));
+        }
+        blocks.add(block);
+        last.put("content", blocks);
+        messages.add(last);
     }
 
     private List<Map<String, Object>> anthropicTools(List<Map<String, Object>> tools) {
@@ -206,7 +232,9 @@ public class AnthropicClient implements LlmClient {
                     if (usage.isObject()) {
                         queue.add(new StreamEvent.UsageEvent(new Usage(
                                 usage.path("input_tokens").asLong(0),
-                                usage.path("output_tokens").asLong(0))));
+                                usage.path("output_tokens").asLong(0),
+                                usage.path("cache_creation_input_tokens").asLong(0),
+                                usage.path("cache_read_input_tokens").asLong(0))));
                     }
                 }
             }
