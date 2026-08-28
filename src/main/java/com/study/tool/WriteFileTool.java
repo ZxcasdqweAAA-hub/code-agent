@@ -32,8 +32,13 @@ public class WriteFileTool implements Tool {
 
     @Override
     public ToolExecutionResult execute(Map<String, Object> args) {
+        return execute(ToolContext.root(), args);
+    }
+
+    @Override
+    public ToolExecutionResult execute(ToolContext context, Map<String, Object> args) {
         try {
-            Path path = Path.of(ToolSupport.requireString(args, "path"));
+            Path path = context.resolvePath(ToolSupport.requireString(args, "path"));
             String content = ToolSupport.requireString(args, "content");
             Path parent = path.getParent();
             if (parent != null) {

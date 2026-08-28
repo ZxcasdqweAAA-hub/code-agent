@@ -36,9 +36,14 @@ public class GrepTool implements Tool {
 
     @Override
     public ToolExecutionResult execute(Map<String, Object> args) {
+        return execute(ToolContext.root(), args);
+    }
+
+    @Override
+    public ToolExecutionResult execute(ToolContext context, Map<String, Object> args) {
         try {
             Pattern regex = Pattern.compile(ToolSupport.requireString(args, "pattern"));
-            Path root = Path.of(ToolSupport.optionalString(args, "path", "."));
+            Path root = context.resolvePath(ToolSupport.optionalString(args, "path", "."));
             String glob = ToolSupport.optionalString(args, "glob", "");
             List<String> hits = new ArrayList<>();
             try (var paths = Files.walk(root)) {

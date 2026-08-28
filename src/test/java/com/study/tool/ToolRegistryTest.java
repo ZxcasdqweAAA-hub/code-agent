@@ -17,16 +17,38 @@ class ToolRegistryTest {
     Path tempDir;
 
     @Test
-    void definitionsReturnsSixOrdered() {
+    void definitionsReturnsDefaultToolsOrdered() {
         ToolRegistry registry = ToolRegistry.createDefault();
 
         List<Map<String, Object>> schemas = registry.getAllSchemas("openai");
 
-        assertEquals(6, schemas.size());
+        assertEquals(7, registry.count());
+        assertEquals(7, schemas.size());
         assertEquals("ReadFile", schemas.get(0).get("name"));
         assertEquals("WriteFile", schemas.get(1).get("name"));
+        assertEquals("ToolSearch", schemas.get(6).get("name"));
         assertTrue(registry.get("Grep").isPresent());
         assertTrue(registry.get("Missing").isEmpty());
+    }
+
+    @Test
+    void planDefinitionsContainReadOnlyAndSystemToolsOnly() {
+        ToolRegistry registry = ToolRegistry.createDefault();
+        registry.register(new SystemMutatingTool());
+
+        List<String> names = registry.planDefinitions().stream()
+                .map(schema -> String.valueOf(schema.get("name")))
+                .toList();
+
+        assertTrue(names.contains("ReadFile"));
+        assertTrue(names.contains("Glob"));
+        assertTrue(names.contains("Grep"));
+        assertTrue(names.contains("ToolSearch"));
+        assertTrue(names.contains("SystemMutating"));
+        assertFalse(names.contains("WriteFile"));
+        assertFalse(names.contains("EditFile"));
+        assertFalse(names.contains("Bash"));
+        assertTrue(registry.get("ToolSearch").orElseThrow().isSystem());
     }
 
     @Test
@@ -97,5 +119,37 @@ class ToolRegistryTest {
         assertTrue(grep.content().contains("needle"));
         assertFalse(rootGlob.error());
         assertTrue(rootGlob.content().contains("pom.xml"));
+    }
+
+    private static final class SystemMutatingTool implements Tool {
+        @Override
+        public String name() {
+            return "SystemMutating";
+        }
+
+        @Override
+        public String description() {
+            return "test system tool";
+        }
+
+        @Override
+        public Map<String, Object> schema() {
+            return Map.of("type", "object");
+        }
+
+        @Override
+        public boolean readOnly() {
+            return false;
+        }
+
+        @Override
+        public boolean isSystem() {
+            return true;
+        }
+
+        @Override
+        public ToolExecutionResult execute(Map<String, Object> args) {
+            return ToolExecutionResult.ok("ok");
+        }
     }
 }

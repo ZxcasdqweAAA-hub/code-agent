@@ -1,7 +1,9 @@
 package com.study.permission;
 
 public enum Category {
-    READ,
-    WRITE,
-    EXEC
+    FILE_READ,
+    FILE_WRITE,
+    READ_ONLY,
+    BASH,
+    OTHER
 }

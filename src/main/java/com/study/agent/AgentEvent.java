@@ -1,6 +1,6 @@
 package com.study.agent;
 
-public sealed interface AgentEvent permits AgentEvent.Text, AgentEvent.Tool, AgentEvent.Approval, AgentEvent.UsageReport, AgentEvent.Iter, AgentEvent.Notice, AgentEvent.Done, AgentEvent.Failed {
+public sealed interface AgentEvent permits AgentEvent.Text, AgentEvent.Tool, AgentEvent.Approval, AgentEvent.UsageReport, AgentEvent.Iter, AgentEvent.Notice, AgentEvent.Compact, AgentEvent.TurnRolledBack, AgentEvent.Finished {
     record Text(String delta) implements AgentEvent {
     }
 
@@ -19,9 +19,16 @@ public sealed interface AgentEvent permits AgentEvent.Text, AgentEvent.Tool, Age
     record Notice(String message) implements AgentEvent {
     }
 
-    record Done() implements AgentEvent {
+    record Compact(long beforeTokens, long afterTokens, String message) implements AgentEvent {
     }
 
-    record Failed(String message) implements AgentEvent {
+    record TurnRolledBack(String message) implements AgentEvent {
+    }
+
+    record Finished(TurnStatus status, String reason) implements AgentEvent {
+        public Finished {
+            status = status == null ? TurnStatus.FAILED : status;
+            reason = reason == null ? "" : reason;
+        }
     }
 }

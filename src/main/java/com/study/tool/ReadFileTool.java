@@ -30,8 +30,13 @@ public class ReadFileTool implements Tool {
 
     @Override
     public ToolExecutionResult execute(Map<String, Object> args) {
+        return execute(ToolContext.root(), args);
+    }
+
+    @Override
+    public ToolExecutionResult execute(ToolContext context, Map<String, Object> args) {
         try {
-            Path path = Path.of(ToolSupport.requireString(args, "path"));
+            Path path = context.resolvePath(ToolSupport.requireString(args, "path"));
             if (!Files.exists(path)) {
                 return ToolExecutionResult.error("文件不存在: " + path);
             }

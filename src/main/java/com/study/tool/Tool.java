@@ -11,5 +11,21 @@ public interface Tool {
 
     boolean readOnly();
 
+    default boolean isSystem() {
+        return false;
+    }
+
+    default boolean shouldDefer() {
+        return false;
+    }
+
+    default boolean teamOnly() {
+        return false;
+    }
+
     ToolExecutionResult execute(Map<String, Object> args);
+
+    default ToolExecutionResult execute(ToolContext context, Map<String, Object> args) {
+        return execute(args);
+    }
 }

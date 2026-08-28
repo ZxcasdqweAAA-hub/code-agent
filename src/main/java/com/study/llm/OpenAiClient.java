@@ -6,9 +6,6 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.study.config.ProviderConfig;
 import com.study.conversation.Message;
 
-import java.io.BufferedReader;
-import java.io.IOException;
-import java.io.StringReader;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
@@ -18,8 +15,7 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.concurrent.BlockingQueue;
-import java.util.concurrent.LinkedBlockingQueue;
+import java.util.function.Consumer;
 
 public class OpenAiClient implements LlmClient {
     private static final ObjectMapper JSON = new ObjectMapper();
@@ -31,13 +27,22 @@ public class OpenAiClient implements LlmClient {
     public OpenAiClient(ProviderConfig config, String systemPrompt) {
         this.config = config;
         this.systemPrompt = systemPrompt;
+
     }
 
     @Override
-    public BlockingQueue<StreamEvent> stream(Request request) {
-        BlockingQueue<StreamEvent> queue = new LinkedBlockingQueue<>();
-        Thread.ofVirtual().name("openai-stream").start(() -> streamIntoQueue(request, queue));
-        return queue;
+    public LlmStream stream(Request request) {
+        try {
+            HttpRequest httpRequest = HttpRequest.newBuilder(endpoint())
+                    .timeout(Duration.ofMinutes(5))
+                    .header("Authorization", "Bearer " + config.getApiKey())
+                    .header("Content-Type", "application/json")
+                    .POST(HttpRequest.BodyPublishers.ofString(requestBody(request)))
+                    .build();
+            return HttpSseStream.start(httpClient, httpRequest, new OpenAiLineHandler(), "OpenAI 请求失败", this::redact);
+        } catch (Exception e) {
+            return FailedLlmStream.of("OpenAI 请求失败: " + e.getMessage());
+        }
     }
 
     @Override
@@ -48,29 +53,6 @@ public class OpenAiClient implements LlmClient {
     @Override
     public String model() {
         return config.getModel();
-    }
-
-    private void streamIntoQueue(Request req, BlockingQueue<StreamEvent> queue) {
-        try {
-            HttpRequest request = HttpRequest.newBuilder(endpoint())
-                    .timeout(Duration.ofMinutes(5))
-                    .header("Authorization", "Bearer " + config.getApiKey())
-                    .header("Content-Type", "application/json")
-                    .POST(HttpRequest.BodyPublishers.ofString(requestBody(req)))
-                    .build();
-            HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
-            if (!isSuccess(response.statusCode())) {
-                queue.add(new StreamEvent.Error("OpenAI 请求失败，HTTP " + response.statusCode() + ": " + redact(response.body())));
-                return;
-            }
-            readSse(response.body(), queue);
-            queue.add(new StreamEvent.StreamEnd("stop", 0, 0));
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            queue.add(new StreamEvent.Error("OpenAI 请求已中断"));
-        } catch (Exception e) {
-            queue.add(new StreamEvent.Error("OpenAI 请求失败: " + e.getMessage()));
-        }
     }
 
     private URI endpoint() {
@@ -159,66 +141,17 @@ public class OpenAiClient implements LlmClient {
         }).toList();
     }
 
-    private void readSse(String body, BlockingQueue<StreamEvent> queue) throws IOException {
-        Map<Integer, ToolCallBuilder> toolBuilders = new LinkedHashMap<>();
-        try (BufferedReader reader = new BufferedReader(new StringReader(body))) {
-            String line;
-            while ((line = reader.readLine()) != null) {
-                if (!line.startsWith("data:")) {
-                    continue;
-                }
-                String data = line.substring("data:".length()).trim();
-                if (data.isEmpty() || "[DONE]".equals(data)) {
-                    continue;
-                }
-                JsonNode root = JSON.readTree(data);
-                JsonNode usage = root.path("usage");
-                if (usage.isObject() && !usage.isMissingNode() && !usage.isNull()) {
-                    long cacheRead = usage.path("prompt_tokens_details").path("cached_tokens").asLong(0);
-                    queue.add(new StreamEvent.UsageEvent(new Usage(
-                            usage.path("prompt_tokens").asLong(0),
-                            usage.path("completion_tokens").asLong(0),
-                            0,
-                            cacheRead)));
-                }
-                JsonNode delta = root.path("choices").path(0).path("delta");
-                JsonNode content = delta.path("content");
-                if (content.isTextual()) {
-                    queue.add(new StreamEvent.TextDelta(content.asText()));
-                }
-                JsonNode toolCalls = delta.path("tool_calls");
-                if (toolCalls.isArray()) {
-                    for (JsonNode toolCall : toolCalls) {
-                        int index = toolCall.path("index").asInt(0);
-                        ToolCallBuilder builder = toolBuilders.computeIfAbsent(index, ignored -> new ToolCallBuilder());
-                        if (toolCall.path("id").isTextual()) {
-                            builder.id = toolCall.path("id").asText();
-                        }
-                        JsonNode function = toolCall.path("function");
-                        if (function.path("name").isTextual()) {
-                            builder.name = function.path("name").asText();
-                        }
-                        if (function.path("arguments").isTextual()) {
-                            builder.arguments.append(function.path("arguments").asText());
-                            queue.add(new StreamEvent.ToolCallDelta(builder.id, builder.name, function.path("arguments").asText()));
-                        }
-                    }
-                }
-            }
+    static Usage usageFrom(JsonNode usage) {
+        long cacheRead = usage.path("prompt_cache_hit_tokens").asLong(-1);
+        if (cacheRead < 0) {
+            cacheRead = usage.path("prompt_tokens_details").path("cached_tokens").asLong(0);
         }
-        for (ToolCallBuilder builder : toolBuilders.values()) {
-            if (builder.name != null && !builder.name.isBlank()) {
-                queue.add(new StreamEvent.ToolCallComplete(builder.id, builder.name, normalizeJson(builder.arguments.toString())));
-            }
-        }
+        long input = usage.path("prompt_tokens").asLong(0);
+        return new Usage(input, usage.path("completion_tokens").asLong(0), 0, cacheRead, input);
     }
 
     private String normalizeJson(String arguments) {
         return arguments == null || arguments.isBlank() ? "{}" : arguments;
-    }
-
-    private boolean isSuccess(int status) {
-        return status >= 200 && status < 300;
     }
 
     private String redact(String body) {
@@ -232,5 +165,74 @@ public class OpenAiClient implements LlmClient {
         private String id = "tool-call";
         private String name = "";
         private final StringBuilder arguments = new StringBuilder();
+    }
+
+    private final class OpenAiLineHandler implements HttpSseStream.LineHandler {
+        private final Map<Integer, ToolCallBuilder> toolBuilders = new LinkedHashMap<>();
+        private boolean toolsCompleted;
+
+        @Override
+        public void onLine(String line, Consumer<StreamEvent> emit) throws Exception {
+            if (!line.startsWith("data:")) {
+                return;
+            }
+            String data = line.substring("data:".length()).trim();
+            if (data.isEmpty()) {
+                return;
+            }
+            if ("[DONE]".equals(data)) {
+                completeTools(emit);
+                emit.accept(new StreamEvent.StreamEnd("stop", 0, 0));
+                return;
+            }
+            JsonNode root = JSON.readTree(data);
+            JsonNode usage = root.path("usage");
+            if (usage.isObject() && !usage.isNull()) {
+                emit.accept(new StreamEvent.UsageEvent(usageFrom(usage)));
+            }
+            JsonNode delta = root.path("choices").path(0).path("delta");
+            JsonNode content = delta.path("content");
+            if (content.isTextual()) {
+                emit.accept(new StreamEvent.TextDelta(content.asText()));
+            }
+            JsonNode toolCalls = delta.path("tool_calls");
+            if (!toolCalls.isArray()) {
+                return;
+            }
+            for (JsonNode toolCall : toolCalls) {
+                int index = toolCall.path("index").asInt(0);
+                ToolCallBuilder builder = toolBuilders.computeIfAbsent(index, ignored -> new ToolCallBuilder());
+                if (toolCall.path("id").isTextual()) {
+                    builder.id = toolCall.path("id").asText();
+                }
+                JsonNode function = toolCall.path("function");
+                if (function.path("name").isTextual()) {
+                    builder.name = function.path("name").asText();
+                }
+                if (function.path("arguments").isTextual()) {
+                    String arguments = function.path("arguments").asText();
+                    builder.arguments.append(arguments);
+                    emit.accept(new StreamEvent.ToolCallDelta(builder.id, builder.name, arguments));
+                }
+            }
+        }
+
+        @Override
+        public void onEnd(Consumer<StreamEvent> emit) {
+            completeTools(emit);
+        }
+
+        private void completeTools(Consumer<StreamEvent> emit) {
+            if (toolsCompleted) {
+                return;
+            }
+            toolsCompleted = true;
+            for (ToolCallBuilder builder : toolBuilders.values()) {
+                if (builder.name != null && !builder.name.isBlank()) {
+                    emit.accept(new StreamEvent.ToolCallComplete(
+                            builder.id, builder.name, normalizeJson(builder.arguments.toString())));
+                }
+            }
+        }
     }
 }

@@ -31,6 +31,11 @@ public class BashTool implements Tool {
 
     @Override
     public ToolExecutionResult execute(Map<String, Object> args) {
+        return execute(ToolContext.root(), args);
+    }
+
+    @Override
+    public ToolExecutionResult execute(ToolContext context, Map<String, Object> args) {
         Process process = null;
         try {
             String command = ToolSupport.requireString(args, "command");
@@ -38,6 +43,7 @@ public class BashTool implements Tool {
             ProcessBuilder builder = windows
                     ? new ProcessBuilder("cmd", "/C", command)
                     : new ProcessBuilder("sh", "-c", command);
+            builder.directory(context.resolvePath("").toFile());
             builder.redirectErrorStream(true);
             process = builder.start();
             ByteArrayOutputStream output = new ByteArrayOutputStream();

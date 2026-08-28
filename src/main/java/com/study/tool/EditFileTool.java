@@ -32,8 +32,13 @@ public class EditFileTool implements Tool {
 
     @Override
     public ToolExecutionResult execute(Map<String, Object> args) {
+        return execute(ToolContext.root(), args);
+    }
+
+    @Override
+    public ToolExecutionResult execute(ToolContext context, Map<String, Object> args) {
         try {
-            Path path = Path.of(ToolSupport.requireString(args, "path"));
+            Path path = context.resolvePath(ToolSupport.requireString(args, "path"));
             String oldString = ToolSupport.requireString(args, "old_string");
             String newString = ToolSupport.requireString(args, "new_string");
             String content = Files.readString(path);

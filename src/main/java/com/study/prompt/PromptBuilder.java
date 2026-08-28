@@ -18,6 +18,20 @@ public final class PromptBuilder {
     }
 
     public static String buildSystemPrompt() {
-        return assembleSystem(Stream.concat(Modules.fixedModules().stream(), Modules.optionalModules().stream()).toList());
+        return buildSystemPrompt("", "");
+    }
+
+    public static String buildSystemPrompt(String instructions) {
+        return buildSystemPrompt(instructions, "");
+    }
+
+    public static String buildSystemPrompt(String instructions, String memory) {
+        return buildSystemPrompt(instructions, memory, "");
+    }
+
+    public static String buildSystemPrompt(String instructions, String memory, String skillsCatalog) {
+        return assembleSystem(Stream.concat(
+                Modules.fixedModules().stream(),
+                Modules.optionalModules(instructions, memory, skillsCatalog).stream()).toList());
     }
 }

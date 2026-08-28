@@ -15,18 +15,19 @@ public final class Sandbox {
         return root;
     }
 
-    public PermissionResult checkPath(String rawPath) {
+    public PathResult inspect(String rawPath) {
         if (rawPath == null || rawPath.isBlank()) {
-            return PermissionResult.allow("no path argument");
+            return new PathResult(PathStatus.INSIDE, "path resolves to workspace root");
         }
         try {
             Path resolved = resolve(rawPath);
             if (isInside(resolved)) {
-                return PermissionResult.allow("path is inside workspace");
+                return new PathResult(PathStatus.INSIDE, "path is inside workspace");
             }
-            return PermissionResult.deny("Path escapes workspace: " + rawPath);
+            return new PathResult(PathStatus.OUTSIDE, "path is outside workspace: " + rawPath);
         } catch (Exception e) {
-            return PermissionResult.deny("Path is not allowed: " + rawPath + " (" + e.getMessage() + ")");
+            return new PathResult(PathStatus.UNRESOLVED,
+                    "path cannot be resolved: " + rawPath + " (" + e.getMessage() + ")");
         }
     }
 
@@ -37,24 +38,15 @@ public final class Sandbox {
         if (Files.exists(normalized)) {
             return normalized.toRealPath();
         }
-        Path parent = normalized.getParent();
-        if (parent == null) {
-            return normalized.toAbsolutePath().normalize();
-        }
-        Path realParent = Files.exists(parent) ? parent.toRealPath() : nearestExisting(parent);
-        return realParent.resolve(normalized.getFileName()).normalize();
-    }
-
-    private Path nearestExisting(Path path) throws IOException {
-        Path current = path;
+        Path current = normalized;
         while (current != null && !Files.exists(current)) {
             current = current.getParent();
         }
         if (current == null) {
-            return path.toAbsolutePath().normalize();
+            throw new IOException("no existing path ancestor");
         }
         Path real = current.toRealPath();
-        Path suffix = current.relativize(path);
+        Path suffix = current.relativize(normalized);
         return real.resolve(suffix).normalize();
     }
 
@@ -70,5 +62,14 @@ public final class Sandbox {
         } catch (IOException e) {
             return base.toAbsolutePath().normalize();
         }
+    }
+
+    public enum PathStatus {
+        INSIDE,
+        OUTSIDE,
+        UNRESOLVED
+    }
+
+    public record PathResult(PathStatus status, String reason) {
     }
 }

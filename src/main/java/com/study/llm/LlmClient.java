@@ -2,10 +2,8 @@ package com.study.llm;
 
 import com.study.config.ProviderConfig;
 
-import java.util.concurrent.BlockingQueue;
-
 public interface LlmClient {
-    BlockingQueue<StreamEvent> stream(Request request);
+    LlmStream stream(Request request);
 
     String name();
 

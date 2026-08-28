@@ -33,9 +33,14 @@ public class GlobTool implements Tool {
 
     @Override
     public ToolExecutionResult execute(Map<String, Object> args) {
+        return execute(ToolContext.root(), args);
+    }
+
+    @Override
+    public ToolExecutionResult execute(ToolContext context, Map<String, Object> args) {
         try {
             String pattern = ToolSupport.requireString(args, "pattern");
-            Path root = Path.of(ToolSupport.optionalString(args, "path", "."));
+            Path root = context.resolvePath(ToolSupport.optionalString(args, "path", "."));
             var matches = Files.walk(root)
                     .filter(Files::isRegularFile)
                     .filter(path -> GlobMatcher.matches(pattern, root.relativize(path)))

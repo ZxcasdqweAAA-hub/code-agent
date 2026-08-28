@@ -1,6 +1,6 @@
 package com.study.llm;
 
-public sealed interface StreamEvent permits StreamEvent.TextDelta, StreamEvent.ThinkingDelta, StreamEvent.ToolCallDelta, StreamEvent.ToolCallComplete, StreamEvent.UsageEvent, StreamEvent.StreamEnd, StreamEvent.Error {
+public sealed interface StreamEvent permits StreamEvent.TextDelta, StreamEvent.ThinkingDelta, StreamEvent.ToolCallDelta, StreamEvent.ToolCallComplete, StreamEvent.UsageEvent, StreamEvent.StreamEnd, StreamEvent.Error, StreamEvent.Cancelled {
     record TextDelta(String text) implements StreamEvent {
     }
 
@@ -23,5 +23,8 @@ public sealed interface StreamEvent permits StreamEvent.TextDelta, StreamEvent.T
     }
 
     record Error(String message) implements StreamEvent {
+    }
+
+    record Cancelled(String message) implements StreamEvent {
     }
 }

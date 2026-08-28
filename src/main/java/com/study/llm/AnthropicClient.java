@@ -6,9 +6,6 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.study.config.ProviderConfig;
 import com.study.conversation.Message;
 
-import java.io.BufferedReader;
-import java.io.IOException;
-import java.io.StringReader;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
@@ -18,8 +15,7 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.concurrent.BlockingQueue;
-import java.util.concurrent.LinkedBlockingQueue;
+import java.util.function.Consumer;
 
 public class AnthropicClient implements LlmClient {
     private static final ObjectMapper JSON = new ObjectMapper();
@@ -34,10 +30,20 @@ public class AnthropicClient implements LlmClient {
     }
 
     @Override
-    public BlockingQueue<StreamEvent> stream(Request request) {
-        BlockingQueue<StreamEvent> queue = new LinkedBlockingQueue<>();
-        Thread.ofVirtual().name("anthropic-stream").start(() -> streamIntoQueue(request, queue));
-        return queue;
+    public LlmStream stream(Request request) {
+        try {
+            HttpRequest httpRequest = HttpRequest.newBuilder(endpoint())
+                    .timeout(Duration.ofMinutes(5))
+                    .header("x-api-key", config.getApiKey())
+                    .header("anthropic-version", "2023-06-01")
+                    .header("Content-Type", "application/json")
+                    .POST(HttpRequest.BodyPublishers.ofString(requestBody(request)))
+                    .build();
+            return HttpSseStream.start(httpClient, httpRequest, new AnthropicLineHandler(),
+                    "Anthropic 请求失败", this::redact);
+        } catch (Exception e) {
+            return FailedLlmStream.of("Anthropic 请求失败: " + e.getMessage());
+        }
     }
 
     @Override
@@ -48,30 +54,6 @@ public class AnthropicClient implements LlmClient {
     @Override
     public String model() {
         return config.getModel();
-    }
-
-    private void streamIntoQueue(Request req, BlockingQueue<StreamEvent> queue) {
-        try {
-            HttpRequest request = HttpRequest.newBuilder(endpoint())
-                    .timeout(Duration.ofMinutes(5))
-                    .header("x-api-key", config.getApiKey())
-                    .header("anthropic-version", "2023-06-01")
-                    .header("Content-Type", "application/json")
-                    .POST(HttpRequest.BodyPublishers.ofString(requestBody(req)))
-                    .build();
-            HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
-            if (response.statusCode() < 200 || response.statusCode() >= 300) {
-                queue.add(new StreamEvent.Error("Anthropic 请求失败，HTTP " + response.statusCode() + ": " + redact(response.body())));
-                return;
-            }
-            readSse(response.body(), queue);
-            queue.add(new StreamEvent.StreamEnd("stop", 0, 0));
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            queue.add(new StreamEvent.Error("Anthropic 请求已中断"));
-        } catch (Exception e) {
-            queue.add(new StreamEvent.Error("Anthropic 请求失败: " + e.getMessage()));
-        }
     }
 
     private URI endpoint() {
@@ -189,61 +171,12 @@ public class AnthropicClient implements LlmClient {
         }).toList();
     }
 
-    private void readSse(String body, BlockingQueue<StreamEvent> queue) throws IOException {
-        Map<Integer, ToolCallBuilder> toolBuilders = new LinkedHashMap<>();
-        try (BufferedReader reader = new BufferedReader(new StringReader(body))) {
-            String line;
-            while ((line = reader.readLine()) != null) {
-                if (!line.startsWith("data:")) {
-                    continue;
-                }
-                String data = line.substring("data:".length()).trim();
-                if (data.isEmpty()) {
-                    continue;
-                }
-                JsonNode root = JSON.readTree(data);
-                String type = root.path("type").asText("");
-                if ("content_block_start".equals(type)) {
-                    JsonNode block = root.path("content_block");
-                    if ("tool_use".equals(block.path("type").asText(""))) {
-                        int index = root.path("index").asInt(0);
-                        ToolCallBuilder builder = toolBuilders.computeIfAbsent(index, ignored -> new ToolCallBuilder());
-                        builder.id = block.path("id").asText(builder.id);
-                        builder.name = block.path("name").asText(builder.name);
-                    }
-                }
-                if ("content_block_delta".equals(type)) {
-                    int index = root.path("index").asInt(0);
-                    JsonNode delta = root.path("delta");
-                    String deltaType = delta.path("type").asText("");
-                    if ("text_delta".equals(deltaType) && delta.path("text").isTextual()) {
-                        queue.add(new StreamEvent.TextDelta(delta.path("text").asText()));
-                    } else if ("input_json_delta".equals(deltaType) && delta.path("partial_json").isTextual()) {
-                        ToolCallBuilder builder = toolBuilders.computeIfAbsent(index, ignored -> new ToolCallBuilder());
-                        String json = delta.path("partial_json").asText();
-                        builder.arguments.append(json);
-                        queue.add(new StreamEvent.ToolCallDelta(builder.id, builder.name, json));
-                    } else if (delta.path("thinking").isTextual()) {
-                        queue.add(new StreamEvent.ThinkingDelta(delta.path("thinking").asText()));
-                    }
-                }
-                if ("message_delta".equals(type)) {
-                    JsonNode usage = root.path("usage");
-                    if (usage.isObject()) {
-                        queue.add(new StreamEvent.UsageEvent(new Usage(
-                                usage.path("input_tokens").asLong(0),
-                                usage.path("output_tokens").asLong(0),
-                                usage.path("cache_creation_input_tokens").asLong(0),
-                                usage.path("cache_read_input_tokens").asLong(0))));
-                    }
-                }
-            }
-        }
-        for (ToolCallBuilder builder : toolBuilders.values()) {
-            if (builder.name != null && !builder.name.isBlank()) {
-                queue.add(new StreamEvent.ToolCallComplete(builder.id, builder.name, normalizeJson(builder.arguments.toString())));
-            }
-        }
+    static Usage usageFrom(JsonNode usage) {
+        long input = usage.path("input_tokens").asLong(0);
+        long cacheWrite = usage.path("cache_creation_input_tokens").asLong(0);
+        long cacheRead = usage.path("cache_read_input_tokens").asLong(0);
+        return new Usage(input, usage.path("output_tokens").asLong(0), cacheWrite, cacheRead,
+                input + cacheWrite + cacheRead);
     }
 
     private Object parseJsonObject(String json) {
@@ -269,5 +202,103 @@ public class AnthropicClient implements LlmClient {
         private String id = "tool-call";
         private String name = "";
         private final StringBuilder arguments = new StringBuilder();
+        private boolean completed;
+    }
+
+    private final class AnthropicLineHandler implements HttpSseStream.LineHandler {
+        private final Map<Integer, ToolCallBuilder> toolBuilders = new LinkedHashMap<>();
+        private String stopReason = "stop";
+
+        @Override
+        public void onLine(String line, Consumer<StreamEvent> emit) throws Exception {
+            if (!line.startsWith("data:")) {
+                return;
+            }
+            String data = line.substring("data:".length()).trim();
+            if (data.isEmpty()) {
+                return;
+            }
+            JsonNode root = JSON.readTree(data);
+            String type = root.path("type").asText("");
+            if ("error".equals(type)) {
+                emit.accept(new StreamEvent.Error("Anthropic 协议错误: "
+                        + root.path("error").path("message").asText("未知错误")));
+                return;
+            }
+            if ("message_start".equals(type)) {
+                emitUsage(root.path("message").path("usage"), emit);
+                return;
+            }
+            if ("content_block_start".equals(type)) {
+                JsonNode block = root.path("content_block");
+                if ("tool_use".equals(block.path("type").asText(""))) {
+                    int index = root.path("index").asInt(0);
+                    ToolCallBuilder builder = toolBuilders.computeIfAbsent(index, ignored -> new ToolCallBuilder());
+                    builder.id = block.path("id").asText(builder.id);
+                    builder.name = block.path("name").asText(builder.name);
+                }
+                return;
+            }
+            if ("content_block_delta".equals(type)) {
+                handleDelta(root, emit);
+                return;
+            }
+            if ("content_block_stop".equals(type)) {
+                completeTool(root.path("index").asInt(0), emit);
+                return;
+            }
+            if ("message_delta".equals(type)) {
+                stopReason = root.path("delta").path("stop_reason").asText(stopReason);
+                emitUsage(root.path("usage"), emit);
+                return;
+            }
+            if ("message_stop".equals(type)) {
+                completeTools(emit);
+                emit.accept(new StreamEvent.StreamEnd(stopReason, 0, 0));
+            }
+        }
+
+        private void handleDelta(JsonNode root, Consumer<StreamEvent> emit) {
+            int index = root.path("index").asInt(0);
+            JsonNode delta = root.path("delta");
+            String deltaType = delta.path("type").asText("");
+            if ("text_delta".equals(deltaType) && delta.path("text").isTextual()) {
+                emit.accept(new StreamEvent.TextDelta(delta.path("text").asText()));
+            } else if ("input_json_delta".equals(deltaType) && delta.path("partial_json").isTextual()) {
+                ToolCallBuilder builder = toolBuilders.computeIfAbsent(index, ignored -> new ToolCallBuilder());
+                String json = delta.path("partial_json").asText();
+                builder.arguments.append(json);
+                emit.accept(new StreamEvent.ToolCallDelta(builder.id, builder.name, json));
+            } else if ("thinking_delta".equals(deltaType) && delta.path("thinking").isTextual()) {
+                emit.accept(new StreamEvent.ThinkingDelta(delta.path("thinking").asText()));
+            }
+        }
+
+        private void emitUsage(JsonNode usage, Consumer<StreamEvent> emit) {
+            if (usage.isObject() && !usage.isNull()) {
+                emit.accept(new StreamEvent.UsageEvent(usageFrom(usage)));
+            }
+        }
+
+        @Override
+        public void onEnd(Consumer<StreamEvent> emit) {
+            completeTools(emit);
+        }
+
+        private void completeTool(int index, Consumer<StreamEvent> emit) {
+            ToolCallBuilder builder = toolBuilders.get(index);
+            if (builder == null || builder.completed || builder.name == null || builder.name.isBlank()) {
+                return;
+            }
+            builder.completed = true;
+            emit.accept(new StreamEvent.ToolCallComplete(
+                    builder.id, builder.name, normalizeJson(builder.arguments.toString())));
+        }
+
+        private void completeTools(Consumer<StreamEvent> emit) {
+            for (Integer index : toolBuilders.keySet()) {
+                completeTool(index, emit);
+            }
+        }
     }
 }
