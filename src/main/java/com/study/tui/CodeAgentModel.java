@@ -10,6 +10,8 @@ import com.study.agent.TurnCheckpoint;
 import com.study.agent.TurnStatus;
 import com.study.command.Builtins;
 import com.study.command.CommandRegistry;
+import com.study.command.Command;
+import com.study.command.Kind;
 import com.study.command.Dispatch;
 import com.study.command.ModelSwitchResult;
 import com.study.command.ProviderSummary;
@@ -180,6 +182,8 @@ public class CodeAgentModel implements Ui, AutoCloseable {
                 this::appendSession, this::replaceSession, this::truncateSession);
         this.skillExecutor = skillCatalog == null ? null : new Executor(skillCatalog, this::runForkSkill);
         Builtins.registerAll(cmdRegistry);
+        cmdRegistry.register(new Command("task", List.of(), "Manage background tasks", Kind.LOCAL, false,
+                this::handleTaskCommand));
         if (skillCatalog != null) {
             Skills.registerSkillsAsCommands(cmdRegistry, skillSummaries(), this::executeSkillCommand);
         }
@@ -193,17 +197,55 @@ public class CodeAgentModel implements Ui, AutoCloseable {
         subscribeLeadMail();
     }
 
+    private void handleTaskCommand(java.util.concurrent.atomic.AtomicBoolean cancelled, Ui ui, String args) {
+        if (taskManager == null) {
+            ui.println("后台任务未启用");
+            return;
+        }
+        String text = args == null ? "" : args.strip();
+        String[] parts = text.isBlank() ? new String[0] : text.split("\\s+");
+        String action = parts.length == 0 ? "list" : parts[0].toLowerCase();
+        if ("list".equals(action)) {
+            for (var task : taskManager.list()) {
+                ui.println(task.id() + " " + task.status().name().toLowerCase() +
+                        (task.name().isBlank() ? "" : " " + task.name()));
+            }
+            return;
+        }
+        if (("get".equals(action) || "stop".equals(action)) && parts.length >= 2) {
+            String id = parts[1];
+            if ("get".equals(action)) {
+                taskManager.get(id).ifPresentOrElse(task -> ui.println(taskNotification(task)),
+                        () -> ui.println("Unknown task_id: " + id));
+            } else {
+                ui.println(taskManager.stop(id) ? "cancellation requested: " + id : "Unknown task_id: " + id);
+            }
+            return;
+        }
+        if (("approve".equals(action) || "deny".equals(action)) && parts.length >= 3) {
+            Outcome outcome = "approve".equals(action) ? Outcome.ALLOW_ONCE : Outcome.DENY_ONCE;
+            boolean accepted = taskManager.respondApproval(parts[1], parts[2], outcome);
+            ui.println(accepted ? "approval recorded" : "Unknown or inactive approval request");
+            return;
+        }
+        ui.println("用法: /task list | /task get <task_id> | /task stop <task_id> | "
+                + "/task approve <task_id> <approval_id> | /task deny <task_id> <approval_id>");
+    }
+
     public void submitLine(String text, CliIo io) {
         if (text == null || text.isBlank() || io == null) {
             return;
         }
-        if (!idle()) {
-            io.println("错误: 请等待当前任务完成");
-            return;
+        boolean installedIo = currentIo == null;
+        if (installedIo) {
+            currentIo = io;
         }
-        currentIo = io;
         try {
             Dispatch.Parsed parsed = Dispatch.parse(text);
+            if (!idle() && (!parsed.isSlash() || !"task".equalsIgnoreCase(parsed.name()))) {
+                io.println("错误: 当前任务运行中，只接受 /task 指令");
+                return;
+            }
             if (!parsed.isSlash()) {
                 executeTurn(TurnInput.plain(text), io);
                 return;
@@ -221,7 +263,9 @@ public class CodeAgentModel implements Ui, AutoCloseable {
                 error(e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage());
             }
         } finally {
-            currentIo = null;
+            if (installedIo) {
+                currentIo = null;
+            }
         }
     }
 
@@ -961,6 +1005,30 @@ public class CodeAgentModel implements Ui, AutoCloseable {
             public void onComplete() {
             }
         });
+        taskManager.subscribeApprovals().subscribe(new Flow.Subscriber<>() {
+            @Override
+            public void onSubscribe(Flow.Subscription subscription) {
+                subscription.request(Long.MAX_VALUE);
+            }
+
+            @Override
+            public void onNext(String taskId) {
+                taskManager.get(taskId).map(CodeAgentModel.this::taskApprovalNotification).ifPresent(text -> {
+                    hookRuntime.addReminders(List.of(text));
+                    CliIo io = currentIo;
+                    if (io != null) {
+                        io.println(text);
+                    }
+                });
+            }
+
+            @Override public void onError(Throwable throwable) {
+                System.err.println("task approval notification failed: " + throwable.getMessage());
+            }
+
+            @Override public void onComplete() {
+            }
+        });
     }
 
     private void subscribeLeadMail() {
@@ -1005,6 +1073,18 @@ public class CodeAgentModel implements Ui, AutoCloseable {
             out.append("Error: ").append(task.error()).append(System.lineSeparator());
         }
         return out.append("</task-notification>").toString();
+    }
+
+    private String taskApprovalNotification(BackgroundTask task) {
+        var pending = task.pendingApproval();
+        if (pending == null) {
+            return "";
+        }
+        return "后台任务 " + task.id() + " 等待审批" + System.lineSeparator()
+                + "Approval: " + pending.id() + System.lineSeparator()
+                + "Tool: " + pending.toolName() + "(" + cliPreview(pending.arguments()) + ")" + System.lineSeparator()
+                + "使用 /task approve " + task.id() + " " + pending.id() + " 或 /task deny "
+                + task.id() + " " + pending.id();
     }
 
     private Path effectiveCwd() {

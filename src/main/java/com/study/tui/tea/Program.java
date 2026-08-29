@@ -24,12 +24,12 @@ public final class Program {
     public void run() {
         try {
             if (suppliedIo != null) {
-                runLoop(suppliedIo);
+                runLoop(suppliedIo, false);
                 return;
             }
             Terminal terminal = TerminalBuilder.builder().system(true).build();
             try (JLineCliIo io = new JLineCliIo(terminal, model::completionNames)) {
-                runLoop(io);
+                runLoop(io, true);
             }
         } catch (Exception e) {
             System.err.println("终端启动失败: " + e.getMessage());
@@ -38,7 +38,7 @@ public final class Program {
         }
     }
 
-    private void runLoop(CliIo io) {
+    private void runLoop(CliIo io, boolean concurrent) {
         io.println(model.banner().stripTrailing());
         while (!model.quitRequested()) {
             String input;
@@ -50,7 +50,12 @@ public final class Program {
             if (input == null || input.isBlank()) {
                 continue;
             }
-            model.submitLine(input, io);
+            String line = input;
+            if (concurrent) {
+                Thread.ofVirtual().name("cli-input").start(() -> model.submitLine(line, io));
+            } else {
+                model.submitLine(input, io);
+            }
         }
     }
 }

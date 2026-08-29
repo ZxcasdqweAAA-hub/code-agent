@@ -21,6 +21,7 @@ import com.study.task.Manager;
 import com.study.task.TaskGetTool;
 import com.study.task.TaskListTool;
 import com.study.task.TaskStopTool;
+import com.study.task.TaskRespondTool;
 import com.study.team.TeamManager;
 import com.study.team.registry.AgentNameRegistry;
 import com.study.team.tools.SendMessageTool;
@@ -95,6 +96,7 @@ public class Main {
             registry.register(new TaskListTool(taskManager));
             registry.register(new TaskGetTool(taskManager));
             registry.register(new TaskStopTool(taskManager));
+            registry.register(new TaskRespondTool(taskManager));
             registry.register(new AgentTool(subAgentCatalog, taskManager, config.isEnableSubAgentBackground(), root,
                     worktreeManager, teamManager));
             if (teamManager != null) {

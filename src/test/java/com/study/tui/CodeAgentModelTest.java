@@ -74,6 +74,23 @@ class CodeAgentModelTest {
     }
 
     @Test
+    void runningTurnAcceptsOnlyTaskCommands() throws Exception {
+        CodeAgentModel model = model(new ToolRegistry());
+        FakeCliIo io = new FakeCliIo();
+        set(model, "streaming", true);
+
+        model.submitLine("ordinary input", io);
+        model.submitLine("/help", io);
+        model.submitLine("/task list", io);
+
+        assertTrue(io.transcript().contains("只接受 /task 指令"));
+        assertTrue(io.transcript().contains("后台任务未启用"));
+        assertTrue(conversation(model).getMessages().isEmpty());
+        set(model, "streaming", false);
+        model.close();
+    }
+
+    @Test
     void synchronousTurnPrintsAssistantOnceAndReturnsIdle() throws Exception {
         CodeAgentModel model = model(new ToolRegistry());
         set(model, "client", new ScriptedClient(List.of(List.of(

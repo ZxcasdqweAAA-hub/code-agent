@@ -62,6 +62,7 @@ public final class Agent {
     public static final int MAX_ITERATIONS = 25;
     public static final int MAX_UNKNOWN_RUN = 3;
     private static final int PLAN_REMINDER_INTERVAL = 4;
+    private static final long STREAM_IDLE_TIMEOUT_SECONDS = 300;
     private static final String TOOL_SEARCH_NAME = "ToolSearch";
     private static final String LOAD_SKILL_NAME = "load_skill";
     public static final String NOTICE_MAX_ITER = "(已达最大迭代轮数 25，自动停止；可继续发消息推进。)";
@@ -92,6 +93,8 @@ public final class Agent {
     private final Path workspace;
     private final String sessionId;
     private volatile TeamContext teamContext;
+    private volatile ApprovalHandler approvalHandler;
+    private volatile Mode runMode = Mode.DEFAULT;
 
     public Agent(LlmClient client, ToolRegistry registry) {
         this(client, registry, "dev");
@@ -179,6 +182,14 @@ public final class Agent {
         this.teamContext = teamContext;
     }
 
+    public void setApprovalHandler(ApprovalHandler approvalHandler) {
+        this.approvalHandler = approvalHandler;
+    }
+
+    public void setRunMode(Mode runMode) {
+        this.runMode = runMode == null ? Mode.DEFAULT : runMode;
+    }
+
     public BlockingQueue<AgentEvent> run(ConversationManager conversation) {
         return run(conversation, Mode.DEFAULT, new CancelToken());
     }
@@ -198,11 +209,16 @@ public final class Agent {
 
     public String runToCompletion(ConversationManager conversation, String task, CancelToken cancel)
             throws InterruptedException {
+        return runToCompletion(conversation, task, cancel, runMode);
+    }
+
+    public String runToCompletion(ConversationManager conversation, String task, CancelToken cancel, Mode mode)
+            throws InterruptedException {
         TurnCheckpoint checkpoint = TurnCheckpoint.capture(conversation);
         if (task != null && !task.isBlank()) {
             conversation.addUserMessage(task);
         }
-        BlockingQueue<AgentEvent> events = run(conversation, Mode.DEFAULT,
+        BlockingQueue<AgentEvent> events = run(conversation, mode == null ? Mode.DEFAULT : mode,
                 cancel == null ? new CancelToken() : cancel, checkpoint);
         AgentEvent.Finished terminal = null;
         while (true) {
@@ -349,7 +365,7 @@ public final class Agent {
                     out.add(new AgentEvent.Notice(NOTICE_UNKNOWN_TOOLS));
                     ensureAssistantTail(conversation, NOTICE_UNKNOWN_TOOLS);
                     alignLargeToolResultsInMemory(conversation);
-                    finish(out, terminalEmitted, TurnStatus.SUCCEEDED, "");
+                    finish(out, terminalEmitted, TurnStatus.FAILED, "");
                     return;
                 }
             }
@@ -357,7 +373,7 @@ public final class Agent {
             out.add(new AgentEvent.Notice(NOTICE_MAX_ITER));
             ensureAssistantTail(conversation, NOTICE_MAX_ITER);
             alignLargeToolResultsInMemory(conversation);
-            finish(out, terminalEmitted, TurnStatus.SUCCEEDED, "");
+            finish(out, terminalEmitted, TurnStatus.FAILED, "");
         } catch (Exception e) {
             failContextTurn(conversation, checkpoint, toolExecutedThisTurn,
                     e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage(), out, terminalEmitted);
@@ -514,7 +530,12 @@ public final class Agent {
             BlockingQueue<StreamEvent> stream = llmStream.events();
             try {
                 while (true) {
-                    StreamEvent event = stream.take();
+                    StreamEvent event = stream.poll(STREAM_IDLE_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+                    if (event == null) {
+                        llmStream.cancel();
+                        capture.error = "Subagent execution failed";
+                        return capture;
+                    }
                     switch (event) {
                         case StreamEvent.TextDelta delta -> {
                             capture.text.append(delta.text());
@@ -684,7 +705,7 @@ public final class Agent {
             tool = registry.get(call.name()).orElse(null);
         }
         if (tool != null && tool.isSystem()) {
-            ToolExecutionResult result = executeTool(tool, call, cancel, out, conversation);
+            ToolExecutionResult result = executeTool(tool, call, mode, cancel, out, conversation);
             return executed(afterTool(call, result));
         }
         PermissionResult permission = permissions.check(mode, call, tool, workspace);
@@ -693,10 +714,10 @@ public final class Agent {
         }
         if (permission.decision() == Decision.ASK) {
             if (dontAsk) {
-                ToolExecutionResult result = executeTool(tool, call, cancel, out, conversation);
+                ToolExecutionResult result = executeTool(tool, call, mode, cancel, out, conversation);
                 return executed(afterTool(call, result));
             }
-            if (subAgent) {
+            if (subAgent && approvalHandler == null) {
                 return notExecuted(new ToolResult(call.id(), "Permission denied: subagent approval escalation is not enabled.", true));
             }
             Outcome outcome = requestApproval(call, permission.reason(), cancel, out);
@@ -715,17 +736,18 @@ public final class Agent {
             ToolExecutionResult result = registry.execute(toolContext(), call.name(), call.arguments());
             return notExecuted(afterTool(call, result));
         }
-        ToolExecutionResult result = executeTool(tool, call, cancel, out, conversation);
+        ToolExecutionResult result = executeTool(tool, call, mode, cancel, out, conversation);
         return executed(afterTool(call, result));
     }
 
-    private ToolExecutionResult executeTool(Tool tool, ToolCall call, CancelToken cancel, BlockingQueue<AgentEvent> out,
+    private ToolExecutionResult executeTool(Tool tool, ToolCall call, Mode mode, CancelToken cancel, BlockingQueue<AgentEvent> out,
                                             ConversationManager conversation) {
         if (tool instanceof LoadSkillTool loadSkillTool) {
             return loadSkillTool.execute(parseArgs(call.arguments()), skillToolRegistry);
         }
         if (tool instanceof AgentTool agentTool) {
-            return agentTool.execute(new AgentTool.Context(this, conversation, cancel, subAgent), parseArgs(call.arguments()));
+            ApprovalHandler childApproval = (request, childCancel) -> awaitApproval(request, childCancel, out);
+            return agentTool.execute(new AgentTool.Context(this, conversation, cancel, subAgent, mode, childApproval), parseArgs(call.arguments()));
         }
         if (skillToolRegistry.get(tool.name()).isPresent()) {
             return tool.execute(
@@ -961,6 +983,15 @@ public final class Agent {
 
     private Outcome requestApproval(ToolCall call, String reason, CancelToken cancel, BlockingQueue<AgentEvent> out) {
         ApprovalRequest request = new ApprovalRequest(call.name(), call.arguments(), reason, "Bash".equals(call.name()));
+        ApprovalHandler handler = approvalHandler;
+        if (handler != null) {
+            Outcome outcome = handler.request(request, cancel);
+            return outcome == null ? Outcome.DENY_ONCE : outcome;
+        }
+        return awaitApproval(request, cancel, out);
+    }
+
+    private Outcome awaitApproval(ApprovalRequest request, CancelToken cancel, BlockingQueue<AgentEvent> out) {
         out.add(new AgentEvent.Approval(request));
         while (!cancel.isCancelled()) {
             try {
